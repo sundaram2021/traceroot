@@ -11,25 +11,66 @@ import json
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 
-from dotenv import find_dotenv, load_dotenv
+from dotenv import load_dotenv
 
-dotenv_path = find_dotenv()
-if dotenv_path:
-    load_dotenv(dotenv_path)
+EXAMPLE_DIR = Path(__file__).resolve().parent
+EXAMPLE_DOTENV = EXAMPLE_DIR / ".env"
+
+if EXAMPLE_DOTENV.exists():
+    load_dotenv(EXAMPLE_DOTENV, override=True)
 else:
-    print("No .env file found (find_dotenv returned None).\nUsing process environment variables.")
+    print(f"No example .env found at {EXAMPLE_DOTENV}.\nUsing process environment variables.")
 
 from google import genai
-from google.genai import types
+from google.genai import errors as genai_errors, types
 
 import traceroot
 from traceroot import Integration, observe, using_attributes
 
-traceroot.initialize(integrations=[Integration.GOOGLE_GENAI])
+
+def initialize_traceroot() -> None:
+    """Initialize TraceRoot, enabling Gemini auto-instrumentation when available."""
+    gemini_integration = getattr(Integration, "GOOGLE_GENAI", None)
+    if gemini_integration is not None:
+        traceroot.initialize(integrations=[gemini_integration])
+        return
+
+    print(
+        "TraceRoot SDK does not expose Integration.GOOGLE_GENAI; "
+        "continuing without Gemini auto-instrumentation."
+    )
+    traceroot.initialize()
+
+
+initialize_traceroot()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def resolve_gemini_api_key() -> tuple[str | None, str | None]:
+    """Resolve a Gemini API key from the common Google env var names."""
+    if os.getenv("GEMINI_API_KEY"):
+        return os.getenv("GEMINI_API_KEY"), "GEMINI_API_KEY"
+    if os.getenv("GOOGLE_API_KEY"):
+        return os.getenv("GOOGLE_API_KEY"), "GOOGLE_API_KEY"
+    return None, None
+
+
+def rewrite_runtime_error(error: Exception) -> Exception:
+    """Convert common Gemini auth failures into an actionable setup message."""
+    lowered = str(error).lower()
+    if isinstance(error, genai_errors.ClientError) and (
+        "api key expired" in lowered or "api_key_invalid" in lowered
+    ):
+        return RuntimeError(
+            "Gemini authentication failed. Google rejected the configured API key.\n\n"
+            f"Example env file: {EXAMPLE_DOTENV}\n"
+            "Set a fresh `GEMINI_API_KEY` or `GOOGLE_API_KEY` and rerun."
+        )
+    return error
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +213,14 @@ class ReActAgent:
     """ReAct-style agent that reasons and acts in a loop."""
 
     def __init__(self, model: str = "gemini-2.5-flash"):
-        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        api_key, api_key_source = resolve_gemini_api_key()
+        if not api_key:
+            raise ValueError(
+                "No Gemini API key found. Set `GEMINI_API_KEY` or `GOOGLE_API_KEY` in the "
+                f"example env file ({EXAMPLE_DOTENV}) or in your process environment."
+            )
+        self.client = genai.Client(api_key=api_key)
+        self.api_key_source = api_key_source
         self.model = model
         self.contents: list[types.Content] = []
 
@@ -275,6 +323,14 @@ def run_demo():
 
 
 if __name__ == "__main__":
-    with using_attributes(user_id="example-user", session_id="tool-agent-session"):
-        run_demo()
-    traceroot.flush()
+    try:
+        with using_attributes(user_id="example-user", session_id="tool-agent-session"):
+            run_demo()
+    except Exception as exc:
+        rewritten = rewrite_runtime_error(exc)
+        if rewritten is not exc:
+            print(rewritten)
+            raise SystemExit(1)
+        raise
+    finally:
+        traceroot.flush()
